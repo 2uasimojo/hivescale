@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# Run this from an empty directory while logged into a hive.
+# Give it a ClusterDeployment's namespace.
+# It will count and size all of the objects in that namespace, producing
+# a CSV file in the current directory.
+# The file is named _ns.csv and is of the format:
+#   kind,count,totalsize
+# The `totalsize` is intended to approximate the total number of bytes
+# all objects of the `kind` would consume in etcd, which stores them as
+# unformatted JSON, base64-encoded. The script currently also dumps the
+# raw json to files named $kind.json in the current directory.
+
+NS=$1
+if [ -z "$NS" ]; then
+  echo "Usage: $0 NAMESPACE"
+  exit 1
+fi
+if ! oc get namespace "$NS"; then
+  echo "No such namespace: $NS"
+  exit 1
+fi
+
+>_ns.csv
+# Loop over all namespace-scoped kinds
+for k in $(oc api-resources --namespaced=true -o name); do
+  # The API path for foo.operator.openshift.io contains /foo
+  shortk=${k%%.*}
+  # Use a verbose `oc get` to discover the URI to the API. This is me
+  # being lazy. I could probably have computed the path based on
+  # api-resources.
+  # We're looking for the line like:
+  # I0805 21:46:31.661703  108971 round_trippers.go:405] GET https://rh-api.hive-stage-01.n1u3.p1.openshiftapps.com:6443/apis/hive.openshift.io/v1/namespaces/uhc-staging-1erl5ushbp2io38vr596eguoprr7jvqh/syncsetinstances?limit=500 200 OK in 30 milliseconds
+  # Ignore kinds that `oc get` fails on (status other than 2xx).
+  u=$(oc get -n $NS $k -v 6 2>&1 | awk  '$5 == "GET" && $6 ~ /\/'$shortk'/ && $7 ~ /^2/ {print $6}')
+  if [ -z "$u" ]; then
+    echo "Skipping $k"
+    continue
+  fi
+  # Parse the URI, e.g. from
+  # https://rh-api.hive-stage-01.n1u3.p1.openshiftapps.com:6443/apis/hive.openshift.io/v1/namespaces/uhc-staging-1erl5ushbp2io38vr596eguoprr7jvqh/syncsetinstances?limit=500
+  # to
+  # /apis/hive.openshift.io/v1/namespaces/uhc-staging-1erl5ushbp2io38vr596eguoprr7jvqh/syncsetinstances
+  p=$(echo "$u" | sed 's,.*:[0-9]*,,; s/\?.*//')
+  echo "$p"
+  # We went through all this trouble so we could get the JSON
+  # unformatted (so we're not counting newlines and whitespace in our
+  # sizing). Is there another way?
+  oc get --raw="$p" > $k.json
+  l=$(jq -r '.items|length' < $k.json)
+  # etcd stores values base64-encoded, so do that before sizing.
+  s=$(base64 $k.json | wc -c)
+  printf "$k,$l,$s\n" >> _ns.csv
+done
